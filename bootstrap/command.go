@@ -16,7 +16,6 @@ package bootstrap
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,7 +44,7 @@ type Args struct {
 // its dependencies. These can be written to a `${args.OutFile}.d` file
 // so that it is correctly rebuilt when needed in case Blueprint is itself
 // invoked from Ninja
-func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, config interface{}) ([]string, error) {
+func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, config interface{}) []string {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	if args.NoGC {
@@ -55,7 +54,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	if args.Cpuprofile != "" {
 		f, err := os.Create(joinPath(ctx.SrcDir(), args.Cpuprofile))
 		if err != nil {
-			return nil, fmt.Errorf("error opening cpuprofile: %s", err)
+			fatalf("error opening cpuprofile: %s", err)
 		}
 		pprof.StartCPUProfile(f)
 		defer f.Close()
@@ -65,7 +64,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	if args.TraceFile != "" {
 		f, err := os.Create(joinPath(ctx.SrcDir(), args.TraceFile))
 		if err != nil {
-			return nil, fmt.Errorf("error opening trace: %s", err)
+			fatalf("error opening trace: %s", err)
 		}
 		trace.Start(f)
 		defer f.Close()
@@ -73,7 +72,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	}
 
 	if args.ModuleListFile == "" {
-		return nil, fmt.Errorf("-l <moduleListFile> is required and must be nonempty")
+		fatalf("-l <moduleListFile> is required and must be nonempty")
 	}
 	ctx.SetModuleListFile(args.ModuleListFile)
 
@@ -83,7 +82,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	ctx.BeginEvent("list_modules")
 	var filesToParse []string
 	if f, err := ctx.ListModulePaths("."); err != nil {
-		return nil, fmt.Errorf("could not enumerate files: %v\n", err.Error())
+		fatalf("could not enumerate files: %v\n", err.Error())
 	} else {
 		filesToParse = f
 	}
@@ -97,36 +96,36 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 
 	ctx.BeginEvent("parse_bp")
 	if blueprintFiles, errs := ctx.ParseFileList(".", filesToParse, config); len(errs) > 0 {
-		return nil, fatalErrors(errs)
+		fatalErrors(errs)
 	} else {
 		ctx.EndEvent("parse_bp")
 		ninjaDeps = append(ninjaDeps, blueprintFiles...)
 	}
 
 	if resolvedDeps, errs := ctx.ResolveDependencies(config); len(errs) > 0 {
-		return nil, fatalErrors(errs)
+		fatalErrors(errs)
 	} else {
 		ninjaDeps = append(ninjaDeps, resolvedDeps...)
 	}
 
 	if stopBefore == StopBeforePrepareBuildActions {
-		return ninjaDeps, nil
+		return ninjaDeps
 	}
 
 	if ctx.BeforePrepareBuildActionsHook != nil {
 		if err := ctx.BeforePrepareBuildActionsHook(); err != nil {
-			return nil, fatalErrors([]error{err})
+			fatalErrors([]error{err})
 		}
 	}
 
 	if buildActionsDeps, errs := ctx.PrepareBuildActions(config); len(errs) > 0 {
-		return nil, fatalErrors(errs)
+		fatalErrors(errs)
 	} else {
 		ninjaDeps = append(ninjaDeps, buildActionsDeps...)
 	}
 
 	if stopBefore == StopBeforeWriteNinja {
-		return ninjaDeps, nil
+		return ninjaDeps
 	}
 
 	const outFilePermissions = 0666
@@ -138,13 +137,13 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	defer ctx.EndEvent("write_files")
 	if args.EmptyNinjaFile {
 		if err := os.WriteFile(joinPath(ctx.SrcDir(), args.OutFile), []byte(nil), outFilePermissions); err != nil {
-			return nil, fmt.Errorf("error writing empty Ninja file: %s", err)
+			fatalf("error writing empty Ninja file: %s", err)
 		}
 		out = io.Discard.(io.StringWriter)
 	} else {
 		f, err := os.OpenFile(joinPath(ctx.SrcDir(), args.OutFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, outFilePermissions)
 		if err != nil {
-			return nil, fmt.Errorf("error opening Ninja file: %s", err)
+			fatalf("error opening Ninja file: %s", err)
 		}
 		defer f.Close()
 		buf = bufio.NewWriterSize(f, 16*1024*1024)
@@ -152,34 +151,40 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	}
 
 	if err := ctx.WriteBuildFile(out); err != nil {
-		return nil, fmt.Errorf("error writing Ninja file contents: %s", err)
+		fatalf("error writing Ninja file contents: %s", err)
 	}
 
 	if buf != nil {
 		if err := buf.Flush(); err != nil {
-			return nil, fmt.Errorf("error flushing Ninja file contents: %s", err)
+			fatalf("error flushing Ninja file contents: %s", err)
 		}
 	}
 
 	if f != nil {
 		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("error closing Ninja file: %s", err)
+			fatalf("error closing Ninja file: %s", err)
 		}
 	}
 
 	if args.Memprofile != "" {
 		f, err := os.Create(joinPath(ctx.SrcDir(), args.Memprofile))
 		if err != nil {
-			return nil, fmt.Errorf("error opening memprofile: %s", err)
+			fatalf("error opening memprofile: %s", err)
 		}
 		defer f.Close()
 		pprof.WriteHeapProfile(f)
 	}
 
-	return ninjaDeps, nil
+	return ninjaDeps
 }
 
-func fatalErrors(errs []error) error {
+func fatalf(format string, args ...interface{}) {
+	fmt.Printf(format, args...)
+	fmt.Print("\n")
+	os.Exit(1)
+}
+
+func fatalErrors(errs []error) {
 	red := "\x1b[31m"
 	unred := "\x1b[0m"
 
@@ -193,8 +198,7 @@ func fatalErrors(errs []error) error {
 			fmt.Printf("%sinternal error:%s %s\n", red, unred, err)
 		}
 	}
-
-	return errors.New("fatal errors encountered")
+	os.Exit(1)
 }
 
 func joinPath(base, path string) string {
