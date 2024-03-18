@@ -25,6 +25,7 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"runtime/trace"
+	"strings"
 
 	"github.com/google/blueprint"
 )
@@ -39,6 +40,9 @@ type Args struct {
 	Cpuprofile string
 	Memprofile string
 	TraceFile  string
+
+	// Debug data json file
+	ModuleDebugFile string
 }
 
 // RegisterGoModuleTypes adds module types to build tools written in golang
@@ -130,8 +134,21 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		ninjaDeps = append(ninjaDeps, buildActionsDeps...)
 	}
 
+	if args.ModuleDebugFile != "" {
+		ctx.GenerateModuleDebugInfo(args.ModuleDebugFile)
+	}
+
 	if stopBefore == StopBeforeWriteNinja {
 		return ninjaDeps, nil
+	}
+
+	providersValidationChan := make(chan []error, 1)
+	if ctx.GetVerifyProvidersAreUnchanged() {
+		go func() {
+			providersValidationChan <- ctx.VerifyProvidersWereUnchanged()
+		}()
+	} else {
+		providersValidationChan <- nil
 	}
 
 	const outFilePermissions = 0666
@@ -170,6 +187,18 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("error closing Ninja file: %s", err)
 		}
+	}
+
+	providerValidationErrors := <-providersValidationChan
+	if providerValidationErrors != nil {
+		var sb strings.Builder
+		for i, err := range providerValidationErrors {
+			if i != 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(err.Error())
+		}
+		return nil, errors.New(sb.String())
 	}
 
 	if args.Memprofile != "" {
