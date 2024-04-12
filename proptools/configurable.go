@@ -28,7 +28,7 @@ type ConfigurableElements interface {
 }
 
 type ConfigurableEvaluator interface {
-	EvaluateConfiguration(parser.SelectType, string) (string, bool)
+	EvaluateConfiguration(typ parser.SelectType, property, condition string) (string, bool)
 	PropertyErrorf(property, fmt string, args ...interface{})
 }
 
@@ -69,7 +69,7 @@ type Configurable[T ConfigurableElements] struct {
 	propertyName  string
 	typ           parser.SelectType
 	condition     string
-	cases         map[string]T
+	cases         map[string]*T
 	appendWrapper *appendWrapper[T]
 }
 
@@ -79,29 +79,36 @@ var _ configurableMarker = Configurable[string]{}.marker
 // appendWrapper exists so that we can set the value of append
 // from a non-pointer method receiver. (setAppend)
 type appendWrapper[T ConfigurableElements] struct {
-	append Configurable[T]
+	append  Configurable[T]
+	replace bool
 }
 
-func (c *Configurable[T]) GetType() parser.SelectType {
-	return c.typ
-}
-
-func (c *Configurable[T]) GetCondition() string {
-	return c.condition
-}
-
-// Evaluate returns the final value for the configurable property.
-// A configurable property may be unset, in which case Evaluate will return nil.
-func (c *Configurable[T]) Evaluate(evaluator ConfigurableEvaluator) *T {
+// Get returns the final value for the configurable property.
+// A configurable property may be unset, in which case Get will return nil.
+func (c *Configurable[T]) Get(evaluator ConfigurableEvaluator) *T {
 	if c == nil || c.appendWrapper == nil {
 		return nil
 	}
-	return mergeConfiguredValues(
-		c.evaluateNonTransitive(evaluator),
-		c.appendWrapper.append.Evaluate(evaluator),
-		c.propertyName,
-		evaluator,
-	)
+	if c.appendWrapper.replace {
+		return replaceConfiguredValues(
+			c.evaluateNonTransitive(evaluator),
+			c.appendWrapper.append.Get(evaluator),
+		)
+	} else {
+		return appendConfiguredValues(
+			c.evaluateNonTransitive(evaluator),
+			c.appendWrapper.append.Get(evaluator),
+		)
+	}
+}
+
+// GetOrDefault is the same as Get, but will return the provided default value if the property was unset.
+func (c *Configurable[T]) GetOrDefault(evaluator ConfigurableEvaluator, defaultValue T) T {
+	result := c.Get(evaluator)
+	if result != nil {
+		return *result
+	}
+	return defaultValue
 }
 
 func (c *Configurable[T]) evaluateNonTransitive(evaluator ConfigurableEvaluator) *T {
@@ -119,12 +126,12 @@ func (c *Configurable[T]) evaluateNonTransitive(evaluator ConfigurableEvaluator)
 			}
 			panic(fmt.Sprintf("Expected the single branch of an unconfigured select to be %q, got %q", default_select_branch_name, actual))
 		}
-		return &result
+		return result
 	}
-	val, defined := evaluator.EvaluateConfiguration(c.typ, c.condition)
+	val, defined := evaluator.EvaluateConfiguration(c.typ, c.propertyName, c.condition)
 	if !defined {
 		if result, ok := c.cases[default_select_branch_name]; ok {
-			return &result
+			return result
 		}
 		evaluator.PropertyErrorf(c.propertyName, "%s %q was not defined", c.typ.String(), c.condition)
 		return nil
@@ -133,16 +140,16 @@ func (c *Configurable[T]) evaluateNonTransitive(evaluator ConfigurableEvaluator)
 		panic("Evaluator cannot return the default branch")
 	}
 	if result, ok := c.cases[val]; ok {
-		return &result
+		return result
 	}
 	if result, ok := c.cases[default_select_branch_name]; ok {
-		return &result
+		return result
 	}
 	evaluator.PropertyErrorf(c.propertyName, "%s %q had value %q, which was not handled by the select statement", c.typ.String(), c.condition, val)
 	return nil
 }
 
-func mergeConfiguredValues[T ConfigurableElements](a, b *T, propertyName string, evalutor ConfigurableEvaluator) *T {
+func appendConfiguredValues[T ConfigurableElements](a, b *T) *T {
 	if a == nil && b == nil {
 		return nil
 	}
@@ -173,25 +180,26 @@ func mergeConfiguredValues[T ConfigurableElements](a, b *T, propertyName string,
 		result := a + b
 		return any(&result).(*T)
 	case *bool:
-		numNonNil := 0
-		var nonNil *T
+		// Addition of bools will OR them together. This is inherited behavior
+		// from how proptools.ExtendBasicType works with non-configurable bools.
+		result := false
 		if a != nil {
-			numNonNil += 1
-			nonNil = a
+			result = result || *any(a).(*bool)
 		}
 		if b != nil {
-			numNonNil += 1
-			nonNil = b
+			result = result || *any(b).(*bool)
 		}
-		if numNonNil == 1 {
-			return nonNil
-		} else {
-			evalutor.PropertyErrorf(propertyName, "Cannot append bools")
-			return nil
-		}
+		return any(&result).(*T)
 	default:
 		panic("Should be unreachable")
 	}
+}
+
+func replaceConfiguredValues[T ConfigurableElements](a, b *T) *T {
+	if b != nil {
+		return b
+	}
+	return a
 }
 
 // configurableReflection is an interface that exposes some methods that are
@@ -199,7 +207,7 @@ func mergeConfiguredValues[T ConfigurableElements](a, b *T, propertyName string,
 // the property unpacking code. You can't call unexported methods from reflection,
 // (at least without unsafe pointer trickery) so this is the next best thing.
 type configurableReflection interface {
-	setAppend(append any)
+	setAppend(append any, replace bool)
 	configuredType() reflect.Type
 	cloneToReflectValuePtr() reflect.Value
 	isEmpty() bool
@@ -218,15 +226,16 @@ func (c *Configurable[T]) initialize(propertyName string, typ parser.SelectType,
 	c.propertyName = propertyName
 	c.typ = typ
 	c.condition = condition
-	c.cases = cases.(map[string]T)
+	c.cases = cases.(map[string]*T)
 	c.appendWrapper = &appendWrapper[T]{}
 }
 
-func (c Configurable[T]) setAppend(append any) {
+func (c Configurable[T]) setAppend(append any, replace bool) {
 	if c.appendWrapper.append.isEmpty() {
 		c.appendWrapper.append = append.(Configurable[T])
+		c.appendWrapper.replace = replace
 	} else {
-		c.appendWrapper.append.setAppend(append)
+		c.appendWrapper.append.setAppend(append, replace)
 	}
 }
 
@@ -254,10 +263,11 @@ func (c *Configurable[T]) clone() *Configurable[T] {
 		inner = &appendWrapper[T]{}
 		if !c.appendWrapper.append.isEmpty() {
 			inner.append = *c.appendWrapper.append.clone()
+			inner.replace = c.appendWrapper.replace
 		}
 	}
 
-	casesCopy := make(map[string]T, len(c.cases))
+	casesCopy := make(map[string]*T, len(c.cases))
 	for k, v := range c.cases {
 		casesCopy[k] = copyConfiguredValue(v)
 	}
@@ -271,10 +281,14 @@ func (c *Configurable[T]) clone() *Configurable[T] {
 	}
 }
 
-func copyConfiguredValue[T ConfigurableElements](t T) T {
-	switch t2 := any(t).(type) {
+func copyConfiguredValue[T ConfigurableElements](t *T) *T {
+	if t == nil {
+		return nil
+	}
+	switch t2 := any(*t).(type) {
 	case []string:
-		return any(slices.Clone(t2)).(T)
+		result := any(slices.Clone(t2)).(T)
+		return &result
 	default:
 		return t
 	}
