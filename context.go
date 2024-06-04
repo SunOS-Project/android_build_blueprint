@@ -1872,32 +1872,57 @@ func (c *Context) findReverseDependency(module *moduleInfo, config any, destName
 	}}
 }
 
-// applyIncomingTransitions takes a variationMap being used to add a dependency on a module in a moduleGroup
-// and applies the IncomingTransition method of each completed TransitionMutator to modify the requested variation.
-// It finds a variant that existed before the TransitionMutator ran that is a subset of the requested variant to
-// use as the module context for IncomingTransition.
-func (c *Context) applyIncomingTransitions(config any, group *moduleGroup, variant variationMap) {
+// applyTransitions takes a variationMap being used to add a dependency on a module in a moduleGroup
+// and applies the OutgoingTransition and IncomingTransition methods of each completed TransitionMutator to
+// modify the requested variation.  It finds a variant that existed before the TransitionMutator ran that is
+// a subset of the requested variant to use as the module context for IncomingTransition.
+func (c *Context) applyTransitions(config any, module *moduleInfo, group *moduleGroup, variant variationMap,
+	requestedVariations []Variation) variationMap {
 	for _, transitionMutator := range c.transitionMutators {
+		// Apply the outgoing transition if it was not explicitly requested.
+		explicitlyRequested := slices.ContainsFunc(requestedVariations, func(variation Variation) bool {
+			return variation.Mutator == transitionMutator.name
+		})
+		sourceVariation := variant[transitionMutator.name]
+		outgoingVariation := sourceVariation
+		if !explicitlyRequested {
+			ctx := &outgoingTransitionContextImpl{
+				transitionContextImpl{context: c, source: module, dep: nil, depTag: nil, config: config},
+			}
+			outgoingVariation = transitionMutator.mutator.OutgoingTransition(ctx, sourceVariation)
+		}
+
+		// Find an appropriate module to use as the context for the IncomingTransition.
+		appliedIncomingTransition := false
 		for _, inputVariant := range transitionMutator.inputVariants[group] {
 			if inputVariant.variant.variations.subsetOf(variant) {
-				sourceVariation := variant[transitionMutator.name]
-
+				// Apply the incoming transition.
 				ctx := &incomingTransitionContextImpl{
 					transitionContextImpl{context: c, source: nil, dep: inputVariant,
 						depTag: nil, config: config},
 				}
 
-				outgoingVariation := transitionMutator.mutator.IncomingTransition(ctx, sourceVariation)
-				variant[transitionMutator.name] = outgoingVariation
+				finalVariation := transitionMutator.mutator.IncomingTransition(ctx, outgoingVariation)
+				if variant == nil {
+					variant = make(variationMap)
+				}
+				variant[transitionMutator.name] = finalVariation
+				appliedIncomingTransition = true
 				break
 			}
 		}
+		if !appliedIncomingTransition && !explicitlyRequested {
+			// The transition mutator didn't apply anything to the target variant, remove the variation unless it
+			// was explicitly requested when adding the dependency.
+			delete(variant, transitionMutator.name)
+		}
 	}
 
+	return variant
 }
 
 func (c *Context) findVariant(module *moduleInfo, config any,
-	possibleDeps *moduleGroup, variations []Variation, far bool, reverse bool) (*moduleInfo, variationMap) {
+	possibleDeps *moduleGroup, requestedVariations []Variation, far bool, reverse bool) (*moduleInfo, variationMap) {
 
 	// We can't just append variant.Variant to module.dependencyVariant.variantName and
 	// compare the strings because the result won't be in mutator registration order.
@@ -1913,14 +1938,14 @@ func (c *Context) findVariant(module *moduleInfo, config any,
 			newVariant = module.variant.variations.clone()
 		}
 	}
-	for _, v := range variations {
+	for _, v := range requestedVariations {
 		if newVariant == nil {
 			newVariant = make(variationMap)
 		}
 		newVariant[v.Mutator] = v.Variation
 	}
 
-	c.applyIncomingTransitions(config, possibleDeps, newVariant)
+	newVariant = c.applyTransitions(config, module, possibleDeps, newVariant, requestedVariations)
 
 	check := func(variant variationMap) bool {
 		if far {
@@ -2994,7 +3019,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 			// Update module group to contain newly split variants
 			if module.splitModules != nil {
 				if isTransitionMutator {
-					// For transition mutators, save the pre-split variant for reusing later in applyIncomingTransitions.
+					// For transition mutators, save the pre-split variant for reusing later in applyTransitions.
 					transitionMutatorInputVariants[group] = append(transitionMutatorInputVariants[group], module)
 				}
 				group.modules, i = spliceModules(group.modules, i, module.splitModules)
@@ -3478,20 +3503,29 @@ type rename struct {
 	name  string
 }
 
-func (c *Context) moduleMatchingVariant(module *moduleInfo, name string) *moduleInfo {
-	group := c.moduleGroupFromName(name, module.namespace())
+// moduleVariantsThatDependOn takes the name of a module and a dependency and returns the all the variants of the
+// module that depends on the dependency.
+func (c *Context) moduleVariantsThatDependOn(name string, dep *moduleInfo) []*moduleInfo {
+	group := c.moduleGroupFromName(name, dep.namespace())
+	var variants []*moduleInfo
 
 	if group == nil {
 		return nil
 	}
 
-	for _, m := range group.modules {
-		if module.variant.name == m.moduleOrAliasVariant().name {
-			return m.moduleOrAliasTarget()
+	for _, module := range group.modules {
+		m := module.module()
+		if m == nil {
+			continue
+		}
+		for _, moduleDep := range m.directDeps {
+			if moduleDep.module == dep {
+				variants = append(variants, m)
+			}
 		}
 	}
 
-	return nil
+	return variants
 }
 
 func (c *Context) handleRenames(renames []rename) []error {
@@ -3883,7 +3917,7 @@ func (c *Context) OutDir() (string, error) {
 // ModuleTypePropertyStructs returns a mapping from module type name to a list of pointers to
 // property structs returned by the factory for that module type.
 func (c *Context) ModuleTypePropertyStructs() map[string][]interface{} {
-	ret := make(map[string][]interface{})
+	ret := make(map[string][]interface{}, len(c.moduleFactories))
 	for moduleType, factory := range c.moduleFactories {
 		_, ret[moduleType] = factory()
 	}
