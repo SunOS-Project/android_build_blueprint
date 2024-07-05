@@ -15,6 +15,7 @@
 package blueprint
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -49,6 +50,8 @@ var ErrBuildActionsNotReady = errors.New("build actions are not ready")
 
 const maxErrors = 10
 const MockModuleListFile = "bplist"
+
+const OutFilePermissions = 0666
 
 // A Context contains all the state needed to parse a set of Blueprints files
 // and generate a Ninja file.  The process of generating a Ninja file proceeds
@@ -809,43 +812,10 @@ type shouldVisitFileInfo struct {
 // This should be processed before adding any modules to the build graph
 func shouldVisitFile(c *Context, file *parser.File) shouldVisitFileInfo {
 	skippedModules := []string{}
-	var blueprintPackageIncludes *PackageIncludes
 	for _, def := range file.Defs {
 		switch def := def.(type) {
 		case *parser.Module:
 			skippedModules = append(skippedModules, def.Name())
-			if def.Type != "blueprint_package_includes" {
-				continue
-			}
-			module, errs := processModuleDef(def, file.Name, c.moduleFactories, nil, c.ignoreUnknownModuleTypes)
-			if len(errs) > 0 {
-				// This file contains errors in blueprint_package_includes
-				// Visit anyways so that we can report errors on other modules in the file
-				return shouldVisitFileInfo{
-					shouldVisitFile: true,
-					errs:            errs,
-				}
-			}
-			logicModule, _ := c.cloneLogicModule(module)
-			blueprintPackageIncludes = logicModule.(*PackageIncludes)
-		}
-	}
-
-	if blueprintPackageIncludes != nil {
-		packageMatches, err := blueprintPackageIncludes.matchesIncludeTags(c)
-		if err != nil {
-			return shouldVisitFileInfo{
-				errs: []error{err},
-			}
-		} else if !packageMatches {
-			return shouldVisitFileInfo{
-				shouldVisitFile: false,
-				skippedModules:  skippedModules,
-				reasonForSkip: fmt.Sprintf(
-					"module is defined in %q which contains a blueprint_package_includes module with unsatisfied tags",
-					file.Name,
-				),
-			}
 		}
 	}
 
@@ -4140,23 +4110,50 @@ func (c *Context) VerifyProvidersWereUnchanged() []error {
 	if !c.buildActionsReady {
 		return []error{ErrBuildActionsNotReady}
 	}
-	var errors []error
-	for _, m := range c.modulesSorted {
-		for i, provider := range m.providers {
-			if provider != nil {
-				hash, err := proptools.HashProvider(provider)
-				if err != nil {
-					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set, and no longer hashable afterwards: %s", providerRegistry[i].typ, m.Name(), err.Error()))
-					continue
-				}
-				if provider != nil && m.providerInitialValueHashes[i] != hash {
-					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
-				}
-			} else if m.providerInitialValueHashes[i] != 0 {
-				// This should be unreachable, because in setProvider we check if the provider has already been set.
-				errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
-			}
+	toProcess := make(chan *moduleInfo)
+	errorCh := make(chan []error)
+	var wg sync.WaitGroup
+	go func() {
+		for _, m := range c.modulesSorted {
+			toProcess <- m
 		}
+		close(toProcess)
+	}()
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			var errors []error
+			for m := range toProcess {
+				for i, provider := range m.providers {
+					if provider != nil {
+						hash, err := proptools.CalculateHash(provider)
+						if err != nil {
+							errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set, and no longer hashable afterwards: %s", providerRegistry[i].typ, m.Name(), err.Error()))
+							continue
+						}
+						if m.providerInitialValueHashes[i] != hash {
+							errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
+						}
+					} else if m.providerInitialValueHashes[i] != 0 {
+						// This should be unreachable, because in setProvider we check if the provider has already been set.
+						errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
+					}
+				}
+			}
+			if errors != nil {
+				errorCh <- errors
+			}
+			wg.Done()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(errorCh)
+	}()
+
+	var errors []error
+	for newErrors := range errorCh {
+		errors = append(errors, newErrors...)
 	}
 	return errors
 }
@@ -4164,7 +4161,7 @@ func (c *Context) VerifyProvidersWereUnchanged() []error {
 // WriteBuildFile writes the Ninja manifest text for the generated build
 // actions to w.  If this is called before PrepareBuildActions successfully
 // completes then ErrBuildActionsNotReady is returned.
-func (c *Context) WriteBuildFile(w StringWriterWriter) error {
+func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFileName string) error {
 	var err error
 	pprof.Do(c.Context, pprof.Labels("blueprint", "WriteBuildFile"), func(ctx context.Context) {
 		if !c.buildActionsReady {
@@ -4204,7 +4201,7 @@ func (c *Context) WriteBuildFile(w StringWriterWriter) error {
 			return
 		}
 
-		if err = c.writeAllModuleActions(nw); err != nil {
+		if err = c.writeAllModuleActions(nw, shardNinja, ninjaFileName); err != nil {
 			return
 		}
 
@@ -4473,14 +4470,19 @@ func (s moduleSorter) Swap(i, j int) {
 	s.modules[i], s.modules[j] = s.modules[j], s.modules[i]
 }
 
-func (c *Context) writeAllModuleActions(nw *ninjaWriter) error {
+func GetNinjaShardFiles(ninjaFile string) []string {
+	ninjaShardCnt := 10
+	fileNames := make([]string, ninjaShardCnt)
+
+	for i := 0; i < ninjaShardCnt; i++ {
+		fileNames[i] = fmt.Sprintf("%s.%d", ninjaFile, i)
+	}
+	return fileNames
+}
+
+func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaFileName string) error {
 	c.BeginEvent("modules")
 	defer c.EndEvent("modules")
-	headerTemplate := template.New("moduleHeader")
-	if _, err := headerTemplate.Parse(moduleHeaderTemplate); err != nil {
-		// This is a programming error.
-		panic(err)
-	}
 
 	modules := make([]*moduleInfo, 0, len(c.moduleInfo))
 	for _, module := range c.moduleInfo {
@@ -4493,6 +4495,67 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter) error {
 		return err
 	}
 
+	headerTemplate := template.New("moduleHeader")
+	if _, err := headerTemplate.Parse(moduleHeaderTemplate); err != nil {
+		// This is a programming error.
+		panic(err)
+	}
+
+	if shardNinja {
+		var wg sync.WaitGroup
+		errorCh := make(chan error)
+		files := GetNinjaShardFiles(ninjaFileName)
+		shardedModules := proptools.ShardByCount(modules, len(files))
+		for i, batchModules := range shardedModules {
+			file := files[i]
+			wg.Add(1)
+			go func(file string, batchModules []*moduleInfo) {
+				defer wg.Done()
+				f, err := os.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
+				if err != nil {
+					errorCh <- fmt.Errorf("error opening Ninja file shard: %s", err)
+					return
+				}
+				defer func() {
+					err := f.Close()
+					if err != nil {
+						errorCh <- err
+					}
+				}()
+				buf := bufio.NewWriterSize(f, 16*1024*1024)
+				defer func() {
+					err := buf.Flush()
+					if err != nil {
+						errorCh <- err
+					}
+				}()
+				writer := newNinjaWriter(buf)
+				err = c.writeModuleAction(batchModules, writer, headerTemplate)
+				if err != nil {
+					errorCh <- err
+				}
+			}(file, batchModules)
+			nw.Subninja(file)
+		}
+		go func() {
+			wg.Wait()
+			close(errorCh)
+		}()
+
+		var errors []error
+		for newErrors := range errorCh {
+			errors = append(errors, newErrors)
+		}
+		if len(errors) > 0 {
+			return proptools.MergeErrors(errors)
+		}
+		return nil
+	} else {
+		return c.writeModuleAction(modules, nw, headerTemplate)
+	}
+}
+
+func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
 	buf := bytes.NewBuffer(nil)
 
 	for _, module := range modules {
@@ -5118,48 +5181,9 @@ Singleton: {{.name}}
 Factory:   {{.goFactory}}
 `
 
-// Blueprint module type that can be used to gate blueprint files beneath this directory
-type PackageIncludes struct {
-	properties struct {
-		// Package will be included if all include tags in this list are set
-		Match_all []string
+func JoinPath(base, path string) string {
+	if filepath.IsAbs(path) {
+		return path
 	}
-	name *string `blueprint:"mutated"`
-}
-
-func (pi *PackageIncludes) Name() string {
-	return proptools.String(pi.name)
-}
-
-// This module type does not have any build actions
-func (pi *PackageIncludes) GenerateBuildActions(ctx ModuleContext) {
-}
-
-func newPackageIncludesFactory() (Module, []interface{}) {
-	module := &PackageIncludes{}
-	AddLoadHook(module, func(ctx LoadHookContext) {
-		module.name = proptools.StringPtr(ctx.ModuleDir() + "_includes") // Generate a synthetic name
-	})
-	return module, []interface{}{&module.properties}
-}
-
-func RegisterPackageIncludesModuleType(ctx *Context) {
-	ctx.RegisterModuleType("blueprint_package_includes", newPackageIncludesFactory)
-}
-
-func (pi *PackageIncludes) MatchAll() []string {
-	return pi.properties.Match_all
-}
-
-// Returns true if all requested include tags are set in the Context object
-func (pi *PackageIncludes) matchesIncludeTags(ctx *Context) (bool, error) {
-	if len(pi.MatchAll()) == 0 {
-		return false, ctx.ModuleErrorf(pi, "Match_all must be a non-empty list")
-	}
-	for _, includeTag := range pi.MatchAll() {
-		if !ctx.ContainsIncludeTag(includeTag) {
-			return false, nil
-		}
-	}
-	return true, nil
+	return filepath.Join(base, path)
 }
